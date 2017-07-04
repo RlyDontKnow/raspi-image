@@ -290,6 +290,8 @@ camera_control::camera_control(char const *i2c_device, uint8_t i2c_address, int3
   static_assert(register_count == PRIVATE_CAMERA_REGISTER_COUNT, "register_count doesn't match number of registers in enums!");
 
   fd || die("failed to open i2c device");
+  RASPI_ON_FAILURE(this) { close(fd); };
+
   auto linux_error = ioctl(fd, I2C_SLAVE_FORCE, i2c_address);
   (linux_error >= 0) || die("failed to set i2c target");
 
@@ -399,6 +401,9 @@ camera_control::~camera_control()
   (MMAL_SUCCESS == error_code) || die("failed to disable MMAL rawcam");
   error_code = mmal_component_destroy(rawcam);
   (MMAL_SUCCESS == error_code) || die("failed to destroy MMAL rawcam");
+
+  auto linux_error = close(fd);
+  (linux_error >= 0) || die("failed to close i2c device");
 }
 
 void camera_control::apply_changes()
