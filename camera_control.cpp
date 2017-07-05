@@ -279,13 +279,16 @@ camera_control::camera_control(char const *i2c_device, uint8_t i2c_address, int3
     , {0x01A3, 0x00} // LSC_TUNING_B_LO
     , {0x01A4, 0x00} // LSC_KNOT_POINT_FORMAT
 
+      // 0x0A0A: raw10, 0x0808: raw8
     , {0x018C, 0x0A} // CSI_DATA_FORMAT_HI
     , {0x018D, 0x0A} // CSI_DATA_FORMAT_LO
     }
+  , active_register_bank()
   , rawcam()
   , pool()
   , target_frame_time(std::experimental::in_place, 1.0 / 10.0)
   , coarse_integration_time(75e-3)
+  , is_streaming()
 {
   static_assert(register_count == PRIVATE_CAMERA_REGISTER_COUNT, "register_count doesn't match number of registers in enums!");
 
@@ -323,7 +326,6 @@ camera_control::camera_control(char const *i2c_device, uint8_t i2c_address, int3
   (MMAL_SUCCESS == error_code) || die("failed to get parameters for rawcam output");
 
   rx_config.data_lanes = 2;
-  rx_config.image_id = 0x2B;
 
   error_code = mmal_port_parameter_set(output, &rx_config.hdr);
   (MMAL_SUCCESS == error_code) || die("failed to set parameters for rawcam output");
@@ -331,17 +333,14 @@ camera_control::camera_control(char const *i2c_device, uint8_t i2c_address, int3
   error_code = mmal_port_parameter_set_boolean(output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   (MMAL_SUCCESS == error_code) || die("failed to enable zero copy on MMAL rawcam output");
 
-  set_roi({0, 0, constants::imager_width, constants::imager_height});
-  set_output_mode(camera_output_mode::bayer10);
-
-  pool = mmal_port_pool_create(output, output->buffer_num, output->buffer_size);
+  pool = mmal_port_pool_create(output, 0, 0);
   pool || die("failed to enable MMAL rawcam output");
   RASPI_ON_FAILURE(this, output) { mmal_port_pool_destroy(output, pool); };
 
+  set_roi({0, 0, constants::imager_width, constants::imager_height});
+  set_output_mode(camera_output_mode::bayer10);
+
   output->userdata = reinterpret_cast<decltype(output->userdata)>(this);
-  error_code = mmal_port_enable(output, callback);
-  (MMAL_SUCCESS == error_code) || die("failed to enable MMAL rawcam output");
-  RASPI_ON_FAILURE(output) { mmal_port_disable(output); };
 
   // allow changing manufacturer registers
   write_i2c(0x30EB, uint8_t(0x05));
@@ -394,8 +393,6 @@ camera_control::~camera_control()
 
   auto output = rawcam->output[0];
   auto error_code = MMAL_SUCCESS;
-  error_code = mmal_port_disable(output);
-  (MMAL_SUCCESS == error_code) || die("failed to disable MMAL rawcam output");
   mmal_port_pool_destroy(output, pool);
   error_code = mmal_component_disable(rawcam);
   (MMAL_SUCCESS == error_code) || die("failed to disable MMAL rawcam");
@@ -411,7 +408,6 @@ void camera_control::apply_changes()
   // ensure all changes are atomic by writing them to the currently inactive register bank and
   // then activating that bank
 
-  uint8_t const active_register_bank = read_i2c<uint8_t>(constants::frame_bank_switch_address);
   uint8_t const target_register_bank = !active_register_bank;
   uint16_t const register_offset = constants::register_bank_offset[target_register_bank];
 
@@ -424,43 +420,62 @@ void camera_control::apply_changes()
   }
 
   write_i2c(constants::frame_bank_switch_address, target_register_bank);
+  active_register_bank = target_register_bank;
 }
 
 void camera_control::set_output_mode(camera_output_mode mode)
 {
+  auto error_code = MMAL_SUCCESS;
+
+  auto const was_streaming = is_streaming.load();
+  stop_streaming();
+
   MMAL_PARAMETER_CAMERA_RX_CONFIG_T rx_config = {{MMAL_PARAMETER_CAMERA_RX_CONFIG, sizeof(rx_config)}};
   auto output = rawcam->output[0];
 
-  auto error_code = mmal_port_parameter_get(output, &rx_config.hdr);
+  error_code = mmal_port_parameter_get(output, &rx_config.hdr);
   (MMAL_SUCCESS == error_code) || die("failed to get parameters for rawcam output");
 
   switch(mode)
   {
   case camera_output_mode::bayer8:
     registers[ENABLE_COMP10TO8].value = 0;
-    rx_config.unpack = MMAL_CAMERA_RX_CONFIG_UNPACK_10;
-    rx_config.pack = MMAL_CAMERA_RX_CONFIG_PACK_8;
+    // @@@TODO: why doesn't this work?
+    registers[CSI_DATA_FORMAT_HI].value = 0x08;
+    registers[CSI_DATA_FORMAT_LO].value = 0x08;
+    rx_config.unpack = MMAL_CAMERA_RX_CONFIG_UNPACK_NONE;
+    rx_config.pack = MMAL_CAMERA_RX_CONFIG_PACK_NONE;
+    rx_config.image_id = 0x2A; // raw8
     output->format->encoding = MMAL_ENCODING_BAYER_SBGGR8;
     break;
 
   case camera_output_mode::bayer10to8:
     registers[ENABLE_COMP10TO8].value = 1;
+    registers[CSI_DATA_FORMAT_HI].value = 0x08;
+    registers[CSI_DATA_FORMAT_LO].value = 0x08;
     rx_config.unpack = MMAL_CAMERA_RX_CONFIG_UNPACK_NONE;
     rx_config.pack = MMAL_CAMERA_RX_CONFIG_PACK_NONE;
+    rx_config.image_id = 0x2A; // raw8
     output->format->encoding = MMAL_ENCODING_BAYER_SBGGR8;
     break;
 
   case camera_output_mode::bayer10:
     registers[ENABLE_COMP10TO8].value = 0;
+    registers[CSI_DATA_FORMAT_HI].value = 0x0A;
+    registers[CSI_DATA_FORMAT_LO].value = 0x0A;
     rx_config.unpack = MMAL_CAMERA_RX_CONFIG_UNPACK_NONE;
     rx_config.pack = MMAL_CAMERA_RX_CONFIG_PACK_NONE;
+    rx_config.image_id = 0x2B; // raw10
     output->format->encoding = MMAL_ENCODING_BAYER_SBGGR10P;
     break;
 
   case camera_output_mode::bayer16:
     registers[ENABLE_COMP10TO8].value = 0;
+    registers[CSI_DATA_FORMAT_HI].value = 0x0A;
+    registers[CSI_DATA_FORMAT_LO].value = 0x0A;
     rx_config.unpack = MMAL_CAMERA_RX_CONFIG_UNPACK_10;
     rx_config.pack = MMAL_CAMERA_RX_CONFIG_PACK_16;
+    rx_config.image_id = 0x2B; // raw10
     output->format->encoding = MMAL_ENCODING_BAYER_SBGGR16;
     break;
   }
@@ -471,7 +486,15 @@ void camera_control::set_output_mode(camera_output_mode mode)
   error_code = mmal_port_format_commit(output);
   (MMAL_SUCCESS == error_code) || die("failed to commit output format");
 
+  error_code = mmal_pool_resize(pool, output->buffer_num, output->buffer_size);
+  (MMAL_SUCCESS == error_code) || die("failed to resize pool" + std::to_string(error_code));
+
   apply_changes();
+
+  if(was_streaming)
+  {
+    start_streaming();
+  }
 }
 
 void camera_control::set_roi(camera_roi roi)
@@ -528,9 +551,17 @@ void camera_control::set_callback(Handler new_handler)
 
 void camera_control::start_streaming()
 {
-  is_streaming = true;
+  if(is_streaming.exchange(true))
+  {
+    return;
+  }
 
   auto output = rawcam->output[0];
+
+  auto error_code = mmal_port_enable(output, callback);
+  (MMAL_SUCCESS == error_code) || die("failed to enable MMAL rawcam output");
+
+
   for(uint32_t i{}; i < output->buffer_num; ++i)
   {
     auto buffer = mmal_queue_get(pool->queue);
@@ -545,7 +576,16 @@ void camera_control::start_streaming()
 
 void camera_control::stop_streaming()
 {
-  is_streaming = false;
+  if(!is_streaming.exchange(false))
+  {
+    return;
+  }
+
+  auto output = rawcam->output[0];
+
+  auto error_code = mmal_port_disable(output);
+  (MMAL_SUCCESS == error_code) || die("failed to disable MMAL rawcam output");
+
   write_i2c(constants::streaming_control_address, uint8_t(0));
 }
 

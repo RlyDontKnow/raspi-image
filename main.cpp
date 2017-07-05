@@ -42,7 +42,8 @@ int main()
   raspi::camera_control test;
   test.set_callback(handler);
   test.set_frame_time(raspi::camera_control::Duration::zero()); // no specific target fps - makes playing with exposure easier
-  test.set_integration_time(raspi::camera_control::Duration(1.0));
+  test.set_output_mode(raspi::camera_output_mode::bayer16);
+  test.set_integration_time(raspi::camera_control::Duration(0.1));
   test.apply_changes();
   test.start_streaming();
 

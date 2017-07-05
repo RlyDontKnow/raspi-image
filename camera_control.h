@@ -135,7 +135,7 @@ private:
   int fd;
   uint8_t i2c_address;
   i2c_register registers[register_count];
-  uint16_t register_offset;
+  uint8_t active_register_bank;
   MMAL_COMPONENT_T *rawcam;
   MMAL_POOL_T *pool;
   std::experimental::optional<Duration> target_frame_time;
